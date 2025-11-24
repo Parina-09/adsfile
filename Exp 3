@@ -1,0 +1,74 @@
+import re
+import time
+import matplotlib.pyplot as plt
+from sklearn.datasets import fetch_20newsgroups
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, classification_report
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+import nltk
+import random	
+nltk.download("stopwords")
+nltk.download("wordnet")
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r"[^a-z\s]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    lemmatizer = WordNetLemmatizer()
+    tokens = text.split()
+    tokens = [lemmatizer.lemmatize(word) for word in tokens if word not in stopwords.words("english")]
+    return " ".join(tokens)
+newsgroups = fetch_20newsgroups(subset='all', shuffle=True, random_state=42)
+X, y = newsgroups.data, newsgroups.target
+X_cleaned = [preprocess_text(doc) for doc in X]
+for i in random.sample(range(len(X_cleaned)), 5):
+    print(f"\nRandom Sample {i}:\n", X_cleaned[i][:300])
+ 
+X_train, X_test, y_train, y_test = train_test_split(X_cleaned, y, test_size=0.2, random_state=42)
+vectorizer = TfidfVectorizer(max_features=5000)
+X_train_tfidf = vectorizer.fit_transform(X_train)
+X_test_tfidf = vectorizer.transform(X_test)
+models = {
+    "Naive Bayes": MultinomialNB(),
+    "Logistic Regression": LogisticRegression(max_iter=1000),
+    "Linear SVM": LinearSVC(),
+    "Decision Tree": DecisionTreeClassifier(),
+    "Random Forest": RandomForestClassifier(n_estimators=100),
+    "Neural Network (MLP)": MLPClassifier(hidden_layer_sizes=(100,), max_iter=300)
+}
+results = {}
+for name, model in models.items():
+    start = time.time()
+    model.fit(X_train_tfidf, y_train)
+    y_pred = model.predict(X_test_tfidf)
+    end = time.time()
+    acc = accuracy_score(y_test, y_pred)
+    runtime = end - start
+    results[name] = {"accuracy": acc, "runtime": runtime}
+    print(f"\n=== {name} ===")
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Training + Prediction Time: {runtime:.2f} seconds")
+    print(classification_report(y_test, y_pred, target_names=newsgroups.target_names))
+model_names = list(results.keys())
+accuracies = [results[m]["accuracy"] for m in model_names]
+runtimes = [results[m]["runtime"] for m in model_names]
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1)
+plt.bar(model_names, accuracies)
+plt.title("Model Accuracy Comparison")
+plt.ylabel("Accuracy")
+plt.xticks(rotation=45)
+plt.subplot(1,2,2)
+plt.bar(model_names, runtimes)
+plt.title("Model Runtime Comparison")
+plt.ylabel("Time (seconds)")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
