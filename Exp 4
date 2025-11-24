@@ -1,0 +1,744 @@
+print("Installing Apache Spark and dependencies...")
+!apt-get update -qq
+!apt-get install -y openjdk-8-jdk-headless -qq > /dev/null
+!wget -q https://archive.apache.org/dist/spark/spark-3.4.0/spark-3.4.0-bin-hadoop3.tgz
+!tar xf spark-3.4.0-bin-hadoop3.tgz
+!pip install -q findspark pyspark==3.4.0
+import os
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-8-openjdk-amd64"
+os.environ["SPARK_HOME"] = "/content/spark-3.4.0-bin-hadoop3"
+# Initialize findspark
+import findspark
+findspark.init()
+print("✅ Spark installation completed!")
+# STEP 2: IMPORT LIBRARIES
+import sys
+sys.path.append('/content/spark-3.4.0-bin-hadoop3/python')
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import (VectorAssembler, StandardScaler, StringIndexer, OneHotEncoder, MinMaxScaler, Bucketizer, PCA)
+from pyspark.ml.classification import (
+LogisticRegression, RandomForestClassifier, GBTClassifier)
+from pyspark.ml.regression import (LinearRegression, RandomForestRegressor, GBTRegressor)
+from pyspark.ml.clustering import KMeans, GaussianMixture
+from pyspark.ml.evaluation import (BinaryClassificationEvaluator, MulticlassClassificationEvaluator,RegressionEvaluator)
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+import time
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+import builtins
+
+class ColabSparkMLProcessor:
+    def __init__(self, app_name="ColabLargeScaleML"):
+        """Initialize Spark session optimized for Colab environment"""
+        print(f"🚀 Initializing Spark session: {app_name}")
+        self.spark = SparkSession.builder \
+            .appName(app_name) \
+            .master("local[*]") \
+            .config("spark.driver.memory", "2g") \
+            .config("spark.driver.maxResultSize", "1g") \
+            .config("spark.sql.adaptive.enabled", "true") \
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+            .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+            .getOrCreate()
+        self.spark.sparkContext.setLogLevel("ERROR")
+        # Get available cores
+        cores = self.spark.sparkContext.defaultParallelism
+        print(f"✅ Spark initialized with {cores} cores")
+        print(f"📊 Spark UI: {self.spark.sparkContext.uiWebUrl}")
+
+    def create_sample_dataset(self, num_rows=100000):
+        """Create sample dataset optimized for Colab memory limits"""
+        print(f"📁 Creating sample dataset with {num_rows:,} rows...")
+        start_time = time.time()
+        # Create dataset with realistic features
+        df = self.spark.range(num_rows) \
+            .select(
+                col("id"),
+                # Numeric features
+                (rand() * 100).alias("feature1"),
+                (randn() * 10 + 50).alias("feature2"),
+                (rand() * 1000).alias("feature3"),
+                (randn() * 5 + 25).alias("feature4"),
+                # Categorical features
+                when(rand() > 0.7, "Category_A")
+                .when(rand() > 0.4, "Category_B")
+                .otherwise("Category_C").alias("category"),
+                when(rand() > 0.6, "High")
+                .when(rand() > 0.3, "Medium")
+                .otherwise("Low").alias("priority"),
+                # Age and income
+                (rand() * 60 + 18).cast("int").alias("age"),
+                (rand() * 80000 + 20000).alias("income"),
+                # Binary target
+                (rand() > 0.4).cast("int").alias("target_binary"),
+                # Continuous target
+                (rand() * 1000 + randn() * 100).alias("target_continuous")
+            )
+        # Optimize for Colab
+        df = df.repartition(4)
+        df.cache()
+        # Force computation
+        count = df.count()
+        creation_time = time.time() - start_time
+        print(f"✅ Dataset created in {creation_time:.2f}s")
+        print(f"📊 Shape: {count:,} rows × {len(df.columns)} columns")
+        return df
+
+    def explore_dataset(self, df):
+        """Comprehensive dataset exploration with visualizations"""
+        print("\n" + "="*50)
+        print("📊 DATASET EXPLORATION")
+        print("="*50)
+        # Basic info
+        print("\n🔍 Dataset Schema:")
+        df.printSchema()
+        print(f"\n📏 Dataset size: {df.count():,} rows")
+        # Statistical summary
+        numeric_cols = [f.name for f in df.schema.fields
+                        if f.dataType in [IntegerType(), LongType(), DoubleType(), FloatType()]]
+        print(f"\n📈 Statistical Summary ({len(numeric_cols)} numeric columns):")
+        stats_df = df.select(numeric_cols).describe()
+        stats_df.show()
+        # Convert to Pandas for visualization
+        stats_pandas = stats_df.toPandas()
+        # Null analysis
+        print("\n❌ Missing Values Analysis:")
+        null_counts = df.select([sum(col(c).isNull().cast("int")).alias(c) for c in df.columns])
+        null_df = null_counts.collect()[0].asDict()
+        for col_name, null_count in null_df.items():
+            print(f" {col_name}: {null_count} nulls")
+        # Categorical analysis
+        categorical_cols = [f.name for f in df.schema.fields if f.dataType == StringType()]
+        print(f"\n🏷️ Categorical Features ({len(categorical_cols)} columns):")
+        for col_name in categorical_cols:
+            print(f"\n {col_name.upper()} Distribution:")
+            cat_dist = df.groupBy(col_name).count().orderBy("count", ascending=False)
+            cat_dist.show(10)
+        # Create visualizations
+        self._create_exploration_plots(df, numeric_cols, categorical_cols)
+        return {
+            'numeric_columns': numeric_cols,
+            'categorical_columns': categorical_cols,
+            'row_count': df.count(),
+            'column_count': len(df.columns)
+        }
+    def _create_exploration_plots(self, df, numeric_cols, categorical_cols):
+        """Create exploration visualizations"""
+        print("\n🎨 Creating visualizations...")
+        # Sample data for plotting (to avoid memory issues)
+        sample_df = df.sample(0.1, seed=42).toPandas()
+        # Set up the plotting style
+        plt.style.use('seaborn-v0_8')
+        fig = plt.figure(figsize=(20, 15))
+        # Numeric features distribution
+        if len(numeric_cols) > 0:
+            for i, col in enumerate(numeric_cols[:6]): # Limit to 6 plots
+                plt.subplot(3, 4, i + 1)
+                plt.hist(sample_df[col], bins=30, alpha=0.7, edgecolor='black')
+                plt.title(f'Distribution of {col}')
+                plt.xlabel(col)
+                plt.ylabel('Frequency')
+        # Categorical features
+        plot_idx = 7
+        for col in categorical_cols[:2]: # Limit to 2 categorical plots
+            plt.subplot(3, 4, plot_idx)
+            value_counts = sample_df[col].value_counts()
+            plt.bar(value_counts.index, value_counts.values)
+            plt.title(f'Distribution of {col}')
+            plt.xlabel(col)
+            plt.ylabel('Count')
+            plt.xticks(rotation=45)
+            plot_idx += 1
+        # Correlation heatmap
+        if len(numeric_cols) > 1:
+            plt.subplot(3, 4, 9)
+            numeric_sample = sample_df[numeric_cols[:6]] # Limit columns
+            corr_matrix = numeric_sample.corr()
+            sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0,
+                        square=True, fmt='.2f', cbar_kws={"shrink": .8})
+            plt.title('Feature Correlations')
+        plt.tight_layout()
+        plt.show()
+    def preprocess_data(self, df, target_col="target_binary"):
+        """Advanced preprocessing pipeline"""
+        print("\n" + "="*50)
+        print("🔧 DATA PREPROCESSING")
+        print("="*50)
+        start_time = time.time()
+        # Identify column types
+        numeric_cols = [f.name for f in df.schema.fields
+                        if f.dataType in [IntegerType(), LongType(), DoubleType(), FloatType()]
+                        and f.name not in [target_col, "target_continuous", "id"]]
+        categorical_cols = [f.name for f in df.schema.fields if f.dataType == StringType()]
+        print(f"📊 Processing {len(numeric_cols)} numeric and {len(categorical_cols)} categorical features")
+        stages = []
+        encoded_cols = []
+        for col_name in categorical_cols:
+            indexer = StringIndexer(
+                inputCol=col_name,
+                outputCol=f"{col_name}_indexed",
+                handleInvalid="keep"
+            )
+            stages.append(indexer)
+            encoder = OneHotEncoder(
+                inputCol=f"{col_name}_indexed",
+                outputCol=f"{col_name}_encoded"
+            )
+            stages.append(encoder)
+            encoded_cols.append(f"{col_name}_encoded")
+        if "age" in df.columns:
+            age_bucketizer = Bucketizer(
+                splits=[-float('inf'), 25, 35, 50, 65, float('inf')],
+                inputCol="age",
+                outputCol="age_group"
+            )
+            stages.append(age_bucketizer)
+            numeric_cols = [col for col in numeric_cols if col != "age"]
+            numeric_cols.append("age_group")
+        feature_cols = numeric_cols + encoded_cols
+        assembler = VectorAssembler(
+            inputCols=feature_cols,
+            outputCol="raw_features",
+            handleInvalid="keep"
+        )
+        stages.append(assembler)
+        scaler = StandardScaler(
+            inputCol="raw_features",
+            outputCol="scaled_features",
+            withStd=True,
+            withMean=True
+        )
+        stages.append(scaler)
+        max_components = builtins.min(10, len(feature_cols))
+        if max_components > 1:
+            pca = PCA(
+                k=max_components,
+                inputCol="scaled_features",
+                outputCol="features"
+            )
+            stages.append(pca)
+        else:
+            from pyspark.ml.feature import SQLTransformer
+            sql_transformer = SQLTransformer(
+                statement="SELECT *, scaled_features as features FROM __THIS__"
+            )
+            stages.append(sql_transformer)
+        print("🏗️ Building preprocessing pipeline...")
+        pipeline = Pipeline(stages=stages)
+        print("⚙️ Fitting preprocessing pipeline...")
+        pipeline_model = pipeline.fit(df)
+        print("🔄 Transforming data...")
+        processed_df = pipeline_model.transform(df)
+        processed_df.cache()
+        # Force computation and show results
+        processed_count = processed_df.count()
+        processing_time = time.time() - start_time
+        print(f"✅ Preprocessing completed in {processing_time:.2f}s")
+        print(f"📊 Processed {processed_count:,} rows")
+        print(f"🎯 Final feature vector size: {len(feature_cols)}")
+        return processed_df, pipeline_model
+
+    def train_classification_models(self, df, target_col="target_binary"):
+        """Train multiple classification models"""
+        print("\n" + "="*50)
+        print("🤖 CLASSIFICATION MODEL TRAINING")
+        print("="*50)
+        print("📂 Splitting data...")
+        train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
+        train_df.cache()
+        test_df.cache()
+        train_count = train_df.count()
+        test_count = test_df.count()
+        print(f"📊 Training set: {train_count:,} rows")
+        print(f"📊 Test set: {test_count:,} rows")
+        models = {}
+        evaluator_binary = BinaryClassificationEvaluator(labelCol=target_col)
+        evaluator_multi = MulticlassClassificationEvaluator(labelCol=target_col)
+        # 1. Logistic Regression
+        print("\n🎯 Training Logistic Regression...")
+        start_time = time.time()
+        lr = LogisticRegression(
+            labelCol=target_col,
+            featuresCol="features",
+            maxIter=100,
+            regParam=0.01
+        )
+        lr_model = lr.fit(train_df)
+        lr_predictions = lr_model.transform(test_df)
+        lr_predictions.cache()
+        lr_auc = evaluator_binary.evaluate(lr_predictions)
+        lr_accuracy = evaluator_multi.evaluate(lr_predictions,
+                                                {evaluator_multi.metricName: "accuracy"})
+        models['Logistic Regression'] = {
+            'model': lr_model,
+            'predictions': lr_predictions,
+            'auc': lr_auc,
+            'accuracy': lr_accuracy,
+            'training_time': time.time() - start_time
+        }
+        print(f" ⏱️ Training time: {models['Logistic Regression']['training_time']:.2f}s")
+        print(f" 📈 AUC: {lr_auc:.4f}")
+        print(f" 🎯 Accuracy: {lr_accuracy:.4f}")
+        # 2. Random Forest
+        print("\n🌲 Training Random Forest...")
+        start_time = time.time()
+        rf = RandomForestClassifier(
+            labelCol=target_col,
+            featuresCol="features",
+            numTrees=50,
+            maxDepth=10,
+            seed=42
+        )
+        rf_model = rf.fit(train_df)
+        rf_predictions = rf_model.transform(test_df)
+        rf_predictions.cache()
+        rf_auc = evaluator_binary.evaluate(rf_predictions)
+        rf_accuracy = evaluator_multi.evaluate(rf_predictions, {evaluator_multi.metricName: "accuracy"})
+        models['Random Forest'] = {
+            'model': rf_model,
+            'predictions': rf_predictions,
+            'auc': rf_auc,
+            'accuracy': rf_accuracy,
+            'training_time': time.time() - start_time
+        }
+        print(f" ⏱️ Training time: {models['Random Forest']['training_time']:.2f}s")
+        print(f" 📈 AUC: {rf_auc:.4f}")
+        print(f" 🎯 Accuracy: {rf_accuracy:.4f}")
+        # 3. Gradient Boosting
+        print("\n🚀 Training Gradient Boosting...")
+        start_time = time.time()
+        gbt = GBTClassifier(
+            labelCol=target_col,
+            featuresCol="features",
+            maxIter=30,
+            maxDepth=5,
+            seed=42
+        )
+        gbt_model = gbt.fit(train_df)
+        gbt_predictions = gbt_model.transform(test_df)
+        gbt_predictions.cache()
+        gbt_auc = evaluator_binary.evaluate(gbt_predictions)
+        gbt_accuracy = evaluator_multi.evaluate(gbt_predictions,
+                                                {evaluator_multi.metricName: "accuracy"})
+        models['Gradient Boosting'] = {
+            'model': gbt_model,
+            'predictions': gbt_predictions,
+            'auc': gbt_auc,
+            'accuracy': gbt_accuracy,
+            'training_time': time.time() - start_time
+        }
+        print(f" ⏱️ Training time: {models['Gradient Boosting']['training_time']:.2f}s")
+        print(f" 📈 AUC: {gbt_auc:.4f}")
+        print(f" 🎯 Accuracy: {gbt_accuracy:.4f}")
+        # Results summary
+        self._plot_classification_results(models)
+        return models
+
+    def train_regression_models(self, df, target_col="target_continuous"):
+        """Train regression models"""
+        print("\n" + "="*50)
+        print("📈 REGRESSION MODEL TRAINING")
+        print("="*50)
+        # Split data
+        train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
+        train_df.cache()
+        test_df.cache()
+        models = {}
+        evaluator = RegressionEvaluator(labelCol=target_col)
+        # Linear Regression
+        print("\n📏 Training Linear Regression...")
+        start_time = time.time()
+        lr = LinearRegression(
+            labelCol=target_col,
+            featuresCol="features",
+            maxIter=100,
+            regParam=0.01
+        )
+        lr_model = lr.fit(train_df)
+        lr_predictions = lr_model.transform(test_df)
+        lr_rmse = evaluator.evaluate(lr_predictions, {evaluator.metricName: "rmse"})
+        lr_r2 = evaluator.evaluate(lr_predictions, {evaluator.metricName: "r2"})
+        models['Linear Regression'] = {
+            'model': lr_model,
+            'predictions': lr_predictions,
+            'rmse': lr_rmse,
+            'r2': lr_r2,
+            'training_time': time.time() - start_time
+        }
+        print(f" ⏱️ Training time: {models['Linear Regression']['training_time']:.2f}s")
+        print(f" 📊 RMSE: {lr_rmse:.4f}")
+        print(f" 📈 R²: {lr_r2:.4f}")
+        # Random Forest Regression
+        print("\n🌳 Training Random Forest Regression...")
+        start_time = time.time()
+        rfr = RandomForestRegressor(
+            labelCol=target_col,
+            featuresCol="features",
+            numTrees=50,
+            maxDepth=10,
+            seed=42
+        )
+        rfr_model = rfr.fit(train_df)
+        rfr_predictions = rfr_model.transform(test_df)
+        rfr_rmse = evaluator.evaluate(rfr_predictions, {evaluator.metricName: "rmse"})
+        rfr_r2 = evaluator.evaluate(rfr_predictions, {evaluator.metricName: "r2"})
+        models['Random Forest Regression'] = {
+            'model': rfr_model,
+            'predictions': rfr_predictions,
+            'rmse': rfr_rmse,
+            'r2': rfr_r2,
+            'training_time': time.time() - start_time
+        }
+        print(f" ⏱️ Training time: {models['Random Forest Regression']['training_time']:.2f}s")
+        print(f" 📊 RMSE: {rfr_rmse:.4f}")
+        print(f" 📈 R²: {rfr_r2:.4f}")
+        return models
+
+    def perform_clustering(self, df, k_values=[3, 5, 7]):
+        """Perform clustering analysis"""
+        print("\n" + "="*50)
+        print("🎯 CLUSTERING ANALYSIS")
+        print("="*50)
+        clustering_results = {}
+        for k in k_values:
+            print(f"\n🔍 K-Means clustering with k={k}...")
+            start_time = time.time()
+            kmeans = KMeans(
+                k=k,
+                featuresCol="features",
+                predictionCol="cluster",
+                seed=42,
+                maxIter=100
+            )
+            kmeans_model = kmeans.fit(df)
+            clustered_df = kmeans_model.transform(df)
+            clustered_df.cache()
+            # Calculate metrics
+            wssse = kmeans_model.summary.trainingCost
+            cluster_centers = kmeans_model.clusterCenters()
+            clustering_results[f'K-Means (k={k})'] = {
+                'model': kmeans_model,
+                'predictions': clustered_df,
+                'wssse': wssse,
+                'cluster_centers': cluster_centers,
+                'training_time': time.time() - start_time
+            }
+            print(f" ⏱️ Training time: {clustering_results[f'K-Means (k={k})']['training_time']:.2f}s")
+            print(f" 📊 WSSSE: {wssse:.4f}")
+            # Show cluster distribution
+            cluster_dist = clustered_df.groupBy("cluster").count().orderBy("cluster")
+            print(" 🎯 Cluster distribution:")
+            cluster_dist.show()
+        return clustering_results
+
+    def _plot_classification_results(self, models):
+        """Plot classification results"""
+        print("\n🎨 Creating results visualization...")
+        # Extract metrics
+        model_names = list(models.keys())
+        aucs = [models[name]['auc'] for name in model_names]
+        accuracies = [models[name]['accuracy'] for name in model_names]
+        times = [models[name]['training_time'] for name in model_names]
+        # Create plots
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        # AUC comparison
+        bars1 = axes[0].bar(model_names, aucs, color=['skyblue', 'lightgreen', 'salmon'])
+        axes[0].set_title('Model AUC Comparison', fontsize=14, fontweight='bold')
+        axes[0].set_ylabel('AUC Score')
+        axes[0].set_ylim([0, 1])
+        axes[0].tick_params(axis='x', rotation=45)
+        # Add value labels on bars
+        for bar, auc in zip(bars1, aucs):
+            axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                         f'{auc:.3f}', ha='center', va='bottom', fontweight='bold')
+        # Accuracy comparison
+        bars2 = axes[1].bar(model_names, accuracies, color=['skyblue', 'lightgreen', 'salmon'])
+        axes[1].set_title('Model Accuracy Comparison', fontsize=14, fontweight='bold')
+        axes[1].set_ylabel('Accuracy')
+        axes[1].set_ylim([0, 1])
+        axes[1].tick_params(axis='x', rotation=45)
+        for bar, acc in zip(bars2, accuracies):
+            axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                         f'{acc:.3f}', ha='center', va='bottom', fontweight='bold')
+        # Training time comparison
+        bars3 = axes[2].bar(model_names, times, color=['skyblue', 'lightgreen', 'salmon'])
+        axes[2].set_title('Training Time Comparison', fontsize=14, fontweight='bold')
+        axes[2].set_ylabel('Training Time (seconds)')
+        axes[2].tick_params(axis='x', rotation=45)
+        for bar, time_val in zip(bars3, times):
+            axes[2].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                     f'{time_val:.1f}s', ha='center', va='bottom', fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+
+    def feature_importance_analysis(self, rf_model, feature_names=None):
+        """Analyze and visualize feature importance"""
+        print("\n" + "="*50)
+        print("🔍 FEATURE IMPORTANCE ANALYSIS")
+        print("="*50)
+        # Get feature importances
+        importances = rf_model.featureImportances.toArray()
+        if feature_names is None:
+            feature_names = [f"Feature_{i}" for i in range(len(importances))]
+        # Create importance DataFrame
+        importance_data = list(zip(feature_names, importances))
+        importance_df = pd.DataFrame(importance_data, columns=['Feature', 'Importance'])
+        importance_df = importance_df.sort_values('Importance', ascending=False)
+        print("🏆 Top 10 Most Important Features:")
+        print(importance_df.head(10).to_string(index=False))
+        # Visualization
+        plt.figure(figsize=(12, 8))
+        top_features = importance_df.head(15)
+        bars = plt.bar(range(len(top_features)), top_features['Importance'],
+                       color='steelblue', alpha=0.8)
+        plt.title('Top 15 Feature Importances', fontsize=16, fontweight='bold')
+        plt.xlabel('Features')
+        plt.ylabel('Importance')
+        plt.xticks(range(len(top_features)), top_features['Feature'], rotation=45, ha='right')
+        # Add value labels
+        for i, bar in enumerate(bars):
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
+                     f'{top_features.iloc[i]["Importance"]:.3f}',
+                     ha='center', va='bottom', fontsize=10)
+        plt.tight_layout()
+        plt.show()
+        return importance_df
+
+    def run_complete_pipeline(self, dataset_size=100000):
+        """Execute the complete ML pipeline"""
+        print("🚀" * 20)
+        print("COMPLETE SPARK ML PIPELINE FOR GOOGLE COLAB")
+        print("🚀" * 20)
+        pipeline_start = time.time()
+        try:
+            # Step 1: Create dataset
+            print("\n📁 STEP 1: Creating Dataset")
+            df = self.create_sample_dataset(dataset_size)
+            # Step 2: Explore dataset
+            print("\n🔍 STEP 2: Dataset Exploration")
+            exploration_results = self.explore_dataset(df)
+            # Step 3: Preprocess data
+            print("\n🔧 STEP 3: Data Preprocessing")
+            processed_df, preprocessing_model = self.preprocess_data(df)
+            # Step 4: Classification
+            print("\n🤖 STEP 4: Classification Models")
+            classification_models = self.train_classification_models(processed_df)
+            # Step 5: Regression
+            print("\n📈 STEP 5: Regression Models")
+            regression_models = self.train_regression_models(processed_df)
+            # Step 6: Clustering
+            print("\n🎯 STEP 6: Clustering Analysis")
+            clustering_results = self.perform_clustering(processed_df)
+            # Step 7: Feature importance
+            print("\n🔍 STEP 7: Feature Importance")
+            rf_model = classification_models['Random Forest']['model']
+            importance_df = self.feature_importance_analysis(rf_model)
+            # Pipeline summary
+            total_time = time.time() - pipeline_start
+            print("\n" + "🎉" * 20)
+            print("PIPELINE COMPLETED SUCCESSFULLY!")
+            print("🎉" * 20)
+            print(f"⏱️ Total execution time: {total_time:.2f} seconds")
+            print(f"📊 Dataset processed: {dataset_size:,} rows")
+            print(f"🤖 Models trained: {len(classification_models) + len(regression_models)} ML models")
+            print(f"🎯 Clustering algorithms: {len(clustering_results)}")
+            return {
+                'dataset': processed_df,
+                'preprocessing_model': preprocessing_model,
+                'classification_models': classification_models,
+                'regression_models': regression_models,
+                'clustering_results': clustering_results,
+                'feature_importance': importance_df,
+                'execution_time': total_time,
+                'exploration_results': exploration_results
+            }
+        except Exception as e:
+            print(f"❌ Error in pipeline execution: {str(e)}")
+            raise e
+
+    def model_performance_dashboard(self, results):
+        """Create a comprehensive performance dashboard"""
+        print("\n" + "="*50)
+        print("📊 MODEL PERFORMANCE DASHBOARD")
+        print("="*50)
+        # Extract data from results
+        classification_models = results['classification_models']
+        regression_models = results['regression_models']
+        clustering_results = results['clustering_results']
+        # Create comprehensive dashboard
+        fig = plt.figure(figsize=(20, 12))
+        # 1. Classification Performance
+        ax1 = plt.subplot(2, 3, 1)
+        model_names = list(classification_models.keys())
+        aucs = [classification_models[name]['auc'] for name in model_names]
+        colors = ['#FF6B6B', '#4ECDC4', '#45B7D1']
+        bars = ax1.bar(model_names, aucs, color=colors, alpha=0.8)
+        ax1.set_title('Classification AUC Scores', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('AUC Score')
+        ax1.set_ylim([0, 1])
+        ax1.tick_params(axis='x', rotation=45)
+        for bar, auc in zip(bars, aucs):
+            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                     f'{auc:.3f}', ha='center', va='bottom', fontweight='bold')
+        # 2. Regression Performance
+        ax2 = plt.subplot(2, 3, 2)
+        reg_names = list(regression_models.keys())
+        r2_scores = [regression_models[name]['r2'] for name in reg_names]
+        bars = ax2.bar(reg_names, r2_scores, color=['#96CEB4', '#FECA57'], alpha=0.8)
+        ax2.set_title('Regression R² Scores', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('R² Score')
+        ax2.tick_params(axis='x', rotation=45)
+        for bar, r2 in zip(bars, r2_scores):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                     f'{r2:.3f}', ha='center', va='bottom', fontweight='bold')
+        # 3. Training Time Comparison
+        ax3 = plt.subplot(2, 3, 3)
+        all_models = list(classification_models.keys()) + list(regression_models.keys())
+        all_times = ([classification_models[name]['training_time'] for name in
+                      classification_models.keys()] +
+                     [regression_models[name]['training_time'] for name in regression_models.keys()])
+        bars = ax3.bar(all_models, all_times,
+                       color=['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57'], alpha=0.8)
+        ax3.set_title('Training Time Comparison', fontsize=14, fontweight='bold')
+        ax3.set_ylabel('Time (seconds)')
+        ax3.tick_params(axis='x', rotation=45)
+        for bar, time_val in zip(bars, all_times):
+            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                     f'{time_val:.1f}s', ha='center', va='bottom', fontweight='bold')
+        # 4. Clustering Results
+        ax4 = plt.subplot(2, 3, 4)
+        cluster_names = list(clustering_results.keys())
+        wssse_values = [clustering_results[name]['wssse'] for name in cluster_names]
+        ax4.plot(range(len(cluster_names)), wssse_values, 'o-', linewidth=2, markersize=8,
+                 color='#E17055')
+        ax4.set_title('K-Means WSSSE by K Value', fontsize=14, fontweight='bold')
+        ax4.set_xlabel('K Value')
+        ax4.set_ylabel('WSSSE')
+        ax4.set_xticks(range(len(cluster_names)))
+        ax4.set_xticklabels([name.split('=')[1].rstrip(')') for name in cluster_names])
+        ax4.grid(True, alpha=0.3)
+        # 5. Feature Importance (Top 10)
+        ax5 = plt.subplot(2, 3, 5)
+        importance_df = results['feature_importance']
+        top_10 = importance_df.head(10)
+        bars = ax5.barh(range(len(top_10)), top_10['Importance'], color='#74B9FF', alpha=0.8)
+        ax5.set_title('Top 10 Feature Importances', fontsize=14, fontweight='bold')
+        ax5.set_xlabel('Importance')
+        ax5.set_yticks(range(len(top_10)))
+        ax5.set_yticklabels(top_10['Feature'])
+        ax5.invert_yaxis()
+        # 6. Model Accuracy Comparison
+        ax6 = plt.subplot(2, 3, 6)
+        accuracies = [classification_models[name]['accuracy'] for name in model_names]
+        # Create a pie chart for accuracy
+        wedges, texts, autotexts = ax6.pie(accuracies, labels=model_names, autopct='%1.3f',
+                                           colors=colors, startangle=90)
+        ax6.set_title('Classification Accuracy Distribution', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+        # Print summary statistics
+        print("\n📈 PERFORMANCE SUMMARY:")
+        print("-" * 40)
+        best_classifier = builtins.max(classification_models.items(), key=lambda x: x[1]['auc'])
+        best_regressor = builtins.max(regression_models.items(), key=lambda x: x[1]['r2'])
+        fastest_model = builtins.min(classification_models.items(), key=lambda x: x[1]['training_time'])
+        print(f"🏆 Best Classifier: {best_classifier[0]} (AUC: {best_classifier[1]['auc']:.4f})")
+        print(f"📈 Best Regressor: {best_regressor[0]} (R²: {best_regressor[1]['r2']:.4f})")
+        print(f"⚡ Fastest Training: {fastest_model[0]} ({fastest_model[1]['training_time']:.2f}s)")
+        print(f"⏱️ Total Pipeline Time: {results['execution_time']:.2f}s")
+
+    def save_results_to_drive(self, results, base_path="/content/drive/MyDrive/spark_ml_results/"):
+        """Save results to Google Drive (if mounted)"""
+        try:
+            import os
+            if not os.path.exists("/content/drive"):
+                print("📁 Google Drive not mounted. To save results:")
+                print(" 1. Run: from google.colab import drive")
+                print(" 2. Run: drive.mount('/content/drive')")
+                return
+            os.makedirs(base_path, exist_ok=True)
+            print(f"💾 Saving results to {base_path}...")
+            importance_df = results['feature_importance']
+            importance_df.to_csv(f"{base_path}feature_importance.csv", index=False)
+            # Save model performance summary
+            summary_data = []
+            # Classification models
+            for name, metrics in results['classification_models'].items():
+                summary_data.append({
+                    'Model': name,
+                    'Type': 'Classification',
+                    'AUC': metrics['auc'],
+                    'Accuracy': metrics['accuracy'],
+                    'Training_Time': metrics['training_time']
+                })
+            # Regression models
+            for name, metrics in results['regression_models'].items():
+                summary_data.append({
+                    'Model': name,
+                    'Type': 'Regression',
+                    'RMSE': metrics['rmse'],
+                    'R2': metrics['r2'],
+                    'Training_Time': metrics['training_time']
+                })
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_csv(f"{base_path}model_performance_summary.csv", index=False)
+            # Save execution summary
+            execution_summary = {
+                'Total_Execution_Time': results['execution_time'],
+                'Dataset_Rows': results['exploration_results']['row_count'],
+                'Dataset_Columns': results['exploration_results']['column_count'],
+                'Models_Trained': len(results['classification_models']) + len(results['regression_models']),
+                'Clustering_Algorithms': len(results['clustering_results'])
+            }
+            summary_text = "\n".join([f"{k}: {v}" for k, v in execution_summary.items()])
+            with open(f"{base_path}execution_summary.txt", 'w') as f:
+                f.write("SPARK ML PIPELINE EXECUTION SUMMARY\n")
+                f.write("="*40 + "\n\n")
+                f.write(summary_text)
+            print("✅ Results saved successfully!")
+            print(f"📂 Files saved:")
+            print(f" - feature_importance.csv")
+            print(f" - model_performance_summary.csv")
+            print(f" - execution_summary.txt")
+        except Exception as e:
+            print(f"❌ Error saving results: {str(e)}")
+
+    def close(self):
+        """Clean up Spark session"""
+        print("\n🧹 Cleaning up Spark session...")
+        self.spark.stop()
+        print("✅ Spark session closed successfully!")
+
+def main():
+    print("🎯 Starting Spark ML Pipeline in Google Colab")
+    print("="*60)
+    processor = ColabSparkMLProcessor(app_name="ColabSparkMLDemo")
+    try:
+        print("\n🚀 Executing complete ML pipeline...")
+        results = processor.run_complete_pipeline(dataset_size=50000)
+        processor.model_performance_dashboard(results)
+        # print("\n🎛️ Running hyperparameter tuning demo...")
+        # cv_model, best_params, test_auc = processor.hyperparameter_tuning_demo(
+        #     results['dataset'], target_col="target_binary"
+        # )
+        processor.save_results_to_drive(results)
+        print("\n" + "🎉" * 25)
+        print("COLAB SPARK ML PIPELINE COMPLETED!")
+        print("🎉" * 25)
+        print(f"📊 Processed {results['exploration_results']['row_count']:,} rows")
+        print(f"🤖 Trained {len(results['classification_models']) + len(results['regression_models'])} models")
+        print(f"⏱️ Total time: {results['execution_time']:.2f} seconds")
+        print(f"🔗 Spark UI: {processor.spark.sparkContext.uiWebUrl}")
+        return results, processor
+    except Exception as e:
+        print(f"❌ Pipeline failed: {str(e)}")
+        processor.close()
+        raise e
+if __name__ == "__main__":
+    results, processor = main()
