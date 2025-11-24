@@ -1,0 +1,158 @@
+import gymnasium as gym 
+import math
+import random
+import numpy as np
+from collections import deque, namedtuple
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import os
+from typing import Tuple
+ENV_NAME = "CartPole-v1"
+SEED = 42
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_EPISODES = 500             
+MAX_STEPS = 500                
+BATCH_SIZE = 64
+GAMMA = 0.99
+LR = 1e-3
+BUFFER_SIZE = 100000
+MIN_REPLAY_SIZE = 1000
+TARGET_UPDATE_FREQ = 1000      
+EPS_START = 1.0
+EPS_END = 0.01
+EPS_DECAY = 0.995              
+MODEL_DIR = "./dqn_cartpole_model"
+os.makedirs(MODEL_DIR, exist_ok=True)
+Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
+class ReplayBuffer:
+    def __init__(self, capacity:int):
+        self.buffer = deque(maxlen=capacity)
+    def push(self, *args):
+        self.buffer.append(Transition(*args))
+    def sample(self, batch_size:int) -> Transition:
+        batch = random.sample(self.buffer, batch_size)
+        return Transition(*zip(*batch))
+    def __len__(self):
+        return len(self.buffer)
+class QNetwork(nn.Module):
+    def __init__(self, state_dim:int, action_dim:int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim)
+        )
+    def forward(self, x):
+        return self.net(x)
+def set_seed(env, seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+def select_action_epsilon(net: nn.Module, state: np.ndarray, eps: float) -> int:
+    if random.random() < eps:
+        return env.action_space.sample()
+    else:
+        state_t = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            qvals = net(state_t)
+        return int(qvals.argmax().item())
+def compute_td_loss(policy_net: nn.Module, target_net: nn.Module, batch: Transition, optimizer) -> float:
+    states = torch.FloatTensor(np.vstack(batch.state)).to(DEVICE)
+    actions = torch.LongTensor(batch.action).unsqueeze(1).to(DEVICE)
+    rewards = torch.FloatTensor(batch.reward).unsqueeze(1).to(DEVICE)
+    next_states = torch.FloatTensor(np.vstack(batch.next_state)).to(DEVICE)
+    dones = torch.FloatTensor(batch.done).unsqueeze(1).to(DEVICE)
+    q_values = policy_net(states).gather(1, actions)  
+    with torch.no_grad():
+        next_q = target_net(next_states).max(1)[0].unsqueeze(1)
+        expected_q = rewards + GAMMA * next_q * (1 - dones)
+    loss = nn.MSELoss()(q_values, expected_q)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+env = gym.make(ENV_NAME)
+set_seed(env, SEED)
+state_dim = env.observation_space.shape[0]
+action_dim = env.action_space.n
+policy_net = QNetwork(state_dim, action_dim).to(DEVICE)
+target_net = QNetwork(state_dim, action_dim).to(DEVICE)
+target_net.load_state_dict(policy_net.state_dict())
+optimizer = optim.Adam(policy_net.parameters(), lr=LR)
+replay_buffer = ReplayBuffer(BUFFER_SIZE)
+print("Populating replay buffer with random transitions...")
+ 
+state, _ = env.reset(seed=SEED)
+for _ in range(MIN_REPLAY_SIZE):
+    action = env.action_space.sample()
+   
+ next_state, reward, terminated, truncated, _ = env.step(action)
+    done = terminated or truncated 
+    replay_buffer.push(state, action, reward, next_state, done)
+    state = next_state if not done else env.reset()[0] 
+print("Replay buffer size:", len(replay_buffer))
+ 
+episode_rewards = []
+total_steps = 0
+eps = EPS_START
+for episode in range(1, NUM_EPISODES + 1):
+    state, _ = env.reset() 
+    episode_reward = 0.0
+    for step in range(MAX_STEPS):
+        action = select_action_epsilon(policy_net, state, eps)
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated 
+        replay_buffer.push(state, action, reward, next_state, done)
+        episode_reward += reward
+        state = next_state
+        total_steps += 1
+        if len(replay_buffer) >= BATCH_SIZE:
+            batch = replay_buffer.sample(BATCH_SIZE)
+            loss = compute_td_loss(policy_net, target_net, batch, optimizer)
+        if total_steps % TARGET_UPDATE_FREQ == 0:
+            target_net.load_state_dict(policy_net.state_dict())
+        if done:
+            break
+    eps = max(EPS_END, eps * EPS_DECAY)
+    episode_rewards.append(episode_reward)
+    if episode % 10 == 0:
+        avg_reward = np.mean(episode_rewards[-50:])
+        print(f"Episode {episode}\tReward: {episode_reward:.2f}\tAvg(50): {avg_reward:.2f}\tEps: {eps:.3f}")
+    if episode % 100 == 0:
+        torch.save(policy_net.state_dict(), os.path.join(MODEL_DIR, f"policy_ep{episode}.pth"))
+torch.save(policy_net.state_dict(), os.path.join(MODEL_DIR, "policy_final.pth"))
+print("Training finished. Model saved to", MODEL_DIR)
+ 
+plt.figure(figsize=(10,5))
+plt.plot(episode_rewards, label="Episode reward")
+plt.xlabel("Episode")
+plt.ylabel("Reward")
+plt.title("Training Reward (DQN on CartPole-v1)")
+plt.legend()
+plt.grid(True)
+plt.show()
+ 
+def evaluate_policy(net: nn.Module, env, episodes=20, render=False) -> float:
+    returns = []
+    for _ in range(episodes):
+        s, _ = env.reset() 
+        total_r = 0.0
+        done = False
+        while not done:
+            a = select_action_epsilon(net, s, eps=0.0)  
+            s, r, terminated, truncated, _ = env.step(a) 
+            done = terminated or truncated 
+            total_r += r
+            if render:
+                env.render() 
+        returns.append(total_r)
+    return float(np.mean(returns)), float(np.std(returns))
+mean_ret, std_ret = evaluate_policy(policy_net, env, episodes=20, render=False)
+print(f"Evaluation over 20 episodes: mean reward = {mean_ret:.2f}, std = {std_ret:.2f}")
+env.close()
