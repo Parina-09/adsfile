@@ -1,0 +1,320 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+BATCH_SIZE = 64
+IMAGE_SIZE = 28
+CHANNELS = 1
+NOISE_DIM = 100
+LEARNING_RATE = 0.0002
+BETA1 = 0.5
+NUM_EPOCHS = 10
+
+FASHION_CLASSES = [
+    'T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat',
+    'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle boot'
+]
+
+class Generator(nn.Module):
+    def __init__(self, noise_dim=100, img_size=28):
+        super(Generator, self).__init__()
+        self.img_size = img_size
+        self.model = nn.Sequential(
+            nn.Linear(noise_dim, 256),
+            nn.ReLU(True),
+            nn.Linear(256, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(True),
+            nn.Linear(512, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(True),
+            nn.Linear(1024, img_size * img_size),
+            nn.Tanh()
+        )
+    
+    def forward(self, z):
+        img = self.model(z)
+        img = img.view(img.shape[0], 1, self.img_size, self.img_size)
+        return img
+
+class Discriminator(nn.Module):
+    def __init__(self, img_size=28):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(img_size * img_size, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, img):
+        img_flat = img.view(img.shape[0], -1)
+        validity = self.model(img_flat)
+        return validity
+
+class FashionGAN:
+    def __init__(self, noise_dim=100, img_size=28, lr=0.0002, beta1=0.5):
+        self.noise_dim = noise_dim
+        self.img_size = img_size
+        self.generator = Generator(noise_dim, img_size).to(device)
+        self.discriminator = Discriminator(img_size).to(device)
+        self.criterion = nn.BCELoss()
+        self.optimizer_G = optim.Adam(self.generator.parameters(), lr=lr, betas=(beta1, 0.999))
+        self.optimizer_D = optim.Adam(self.discriminator.parameters(), lr=lr, betas=(beta1, 0.999))
+        self.g_losses = []
+        self.d_losses = []
+        self.d_acc_real = []
+        self.d_acc_fake = []
+        self._init_weights()
+    
+    def _init_weights(self):
+        for module in [self.generator, self.discriminator]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight.data, 0.0, 0.02)
+                    nn.init.constant_(m.bias.data, 0)
+                elif isinstance(m, nn.BatchNorm1d):
+                    nn.init.normal_(m.weight.data, 1.0, 0.02)
+                    nn.init.constant_(m.bias.data, 0)
+    
+    def train(self, dataloader, num_epochs):
+        print(f"Starting training for {num_epochs} epochs...")
+        print(f"Dataset size: {len(dataloader.dataset)} images")
+        print(f"Batches per epoch: {len(dataloader)}")
+        fixed_noise = torch.randn(16, self.noise_dim, device=device)
+        
+        for epoch in range(num_epochs):
+            epoch_g_loss = 0
+            epoch_d_loss = 0
+            d_real_acc = 0
+            d_fake_acc = 0
+            
+            for i, (real_images, _) in enumerate(dataloader):
+                batch_size = real_images.size(0)
+                real_labels = torch.ones(batch_size, 1, device=device)
+                fake_labels = torch.zeros(batch_size, 1, device=device)
+                real_images = real_images.to(device)
+                
+                self.optimizer_D.zero_grad()
+                real_output = self.discriminator(real_images)
+                d_loss_real = self.criterion(real_output, real_labels)
+                d_real_acc += ((real_output > 0.5).float() == real_labels).float().mean().item()
+                noise = torch.randn(batch_size, self.noise_dim, device=device)
+                fake_images = self.generator(noise)
+                fake_output = self.discriminator(fake_images.detach())
+                d_loss_fake = self.criterion(fake_output, fake_labels)
+                d_fake_acc += ((fake_output <= 0.5).float() == (1 - fake_labels)).float().mean().item()
+                d_loss = d_loss_real + d_loss_fake
+                d_loss.backward()
+                self.optimizer_D.step()
+                
+                self.optimizer_G.zero_grad()
+                fake_output = self.discriminator(fake_images)
+                g_loss = self.criterion(fake_output, real_labels)
+                g_loss.backward()
+                self.optimizer_G.step()
+                
+                epoch_g_loss += g_loss.item()
+                epoch_d_loss += d_loss.item()
+            
+            avg_g_loss = epoch_g_loss / len(dataloader)
+            avg_d_loss = epoch_d_loss / len(dataloader)
+            avg_d_real_acc = d_real_acc / len(dataloader)
+            avg_d_fake_acc = d_fake_acc / len(dataloader)
+            self.g_losses.append(avg_g_loss)
+            self.d_losses.append(avg_d_loss)
+            self.d_acc_real.append(avg_d_real_acc)
+            self.d_acc_fake.append(avg_d_fake_acc)
+            
+            if epoch % 5 == 0 or epoch == num_epochs - 1:
+                print(f"Epoch [{epoch+1:3d}/{num_epochs}] "
+                      f"D_loss: {avg_d_loss:.4f} G_loss: {avg_g_loss:.4f} "
+                      f"D_real_acc: {avg_d_real_acc:.3f} D_fake_acc: {avg_d_fake_acc:.3f}")
+                self.save_sample_images(fixed_noise, epoch)
+        
+        print("\nTraining completed!")
+        self.print_training_summary()
+    
+    def save_sample_images(self, noise, epoch):
+        self.generator.eval()
+        with torch.no_grad():
+            fake_images = self.generator(noise)
+            fake_images = (fake_images + 1) / 2
+            os.makedirs("fashion_samples", exist_ok=True)
+            grid = torchvision.utils.make_grid(fake_images, nrow=4, normalize=True, padding=2)
+            torchvision.utils.save_image(grid, f"fashion_samples/epoch_{epoch:03d}.png")
+        self.generator.train()
+    
+    def generate_fashion_items(self, num_items=16):
+        self.generator.eval()
+        with torch.no_grad():
+            noise = torch.randn(num_items, self.noise_dim, device=device)
+            fake_images = self.generator(noise)
+            fake_images = (fake_images + 1) / 2
+        self.generator.train()
+        return fake_images
+    
+    def plot_training_progress(self):
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        axes[0, 0].plot(self.g_losses, label='Generator Loss', color='blue', linewidth=2)
+        axes[0, 0].plot(self.d_losses, label='Discriminator Loss', color='red', linewidth=2)
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_title('Training Losses')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 1].plot(self.d_acc_real, label='Real Images Accuracy', color='green', linewidth=2)
+        axes[0, 1].plot(self.d_acc_fake, label='Fake Images Accuracy', color='orange', linewidth=2)
+        axes[0, 1].axhline(y=0.5, color='black', linestyle='--', alpha=0.5, label='Random Guess')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Accuracy')
+        axes[0, 1].set_title('Discriminator Accuracy')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].set_ylim(0, 1)
+        fake_images = self.generate_fashion_items(16)
+        grid = torchvision.utils.make_grid(fake_images, nrow=4, normalize=True, padding=2)
+        grid_np = grid.permute(1, 2, 0).cpu().numpy()
+        axes[1, 0].imshow(grid_np.squeeze(), cmap='gray')
+        axes[1, 0].set_title('Generated Fashion Items')
+        axes[1, 0].axis('off')
+        if len(self.g_losses) > 5:
+            window_size = min(5, len(self.g_losses) // 4)
+            g_smooth = np.convolve(self.g_losses, np.ones(window_size)/window_size, mode='valid')
+            d_smooth = np.convolve(self.d_losses, np.ones(window_size)/window_size, mode='valid')
+            axes[1, 1].plot(g_smooth, label='Generator (Smoothed)', color='blue', linewidth=2)
+            axes[1, 1].plot(d_smooth, label='Discriminator (Smoothed)', color='red', linewidth=2)
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].set_ylabel('Loss')
+            axes[1, 1].set_title('Smoothed Training Losses')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    
+    def compare_real_vs_fake(self, real_dataloader):
+        real_batch = next(iter(real_dataloader))[0][:16]
+        fake_batch = self.generate_fashion_items(16)
+        fig, axes = plt.subplots(4, 8, figsize=(16, 8))
+        for i in range(16):
+            row = i // 8
+            col = i % 8
+            axes[row, col].imshow(real_batch[i].squeeze(), cmap='gray')
+            axes[row, col].set_title('Real' if i < 8 else '')
+            axes[row, col].axis('off')
+        for i in range(16):
+            row = (i // 8) + 2
+            col = i % 8
+            axes[row, col].imshow(fake_batch[i].squeeze().cpu(), cmap='gray')
+            axes[row, col].set_title('Generated' if i < 8 else '')
+            axes[row, col].axis('off')
+        plt.suptitle('Real vs Generated Fashion Items', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+    
+    def print_training_summary(self):
+        print("\n" + "="*50)
+        print("TRAINING SUMMARY")
+        print("="*50)
+        print(f"Final Generator Loss: {self.g_losses[-1]:.4f}")
+        print(f"Final Discriminator Loss: {self.d_losses[-1]:.4f}")
+        print(f"Final D Real Accuracy: {self.d_acc_real[-1]:.3f}")
+        print(f"Final D Fake Accuracy: {self.d_acc_fake[-1]:.3f}")
+        print(f"Average Generator Loss: {np.mean(self.g_losses):.4f}")
+        print(f"Average Discriminator Loss: {np.mean(self.d_losses):.4f}")
+        print("="*50)
+    
+    def save_models(self, path="fashion_gan_models"):
+        os.makedirs(path, exist_ok=True)
+        torch.save(self.generator.state_dict(), f"{path}/generator.pth")
+        torch.save(self.discriminator.state_dict(), f"{path}/discriminator.pth")
+        print(f"Models saved to {path}/")
+    
+    def load_models(self, path="fashion_gan_models"):
+        self.generator.load_state_dict(torch.load(f"{path}/generator.pth"))
+        self.discriminator.load_state_dict(torch.load(f"{path}/discriminator.pth"))
+        print(f"Models loaded from {path}/")
+
+def create_fashion_mnist_dataloader(batch_size=64, num_workers=2):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5])
+    ])
+    dataset = torchvision.datasets.FashionMNIST(
+        root='./data',
+        train=True,
+        download=True,
+        transform=transform
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=True,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    return dataloader, dataset
+
+def show_fashion_samples(dataloader, num_samples=20):
+    data_iter = iter(dataloader)
+    images, labels = next(data_iter)
+    fig, axes = plt.subplots(4, 5, figsize=(12, 10))
+    axes = axes.ravel()
+    for i in range(num_samples):
+        img = images[i].squeeze()
+        label = labels[i].item()
+        axes[i].imshow(img, cmap='gray')
+        axes[i].set_title(f'{FASHION_CLASSES[label]}')
+        axes[i].axis('off')
+    plt.suptitle('Fashion-MNIST Sample Images', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+def main():
+    print("Fashion-MNIST GAN Training")
+    print("=" * 40)
+    print("Loading Fashion-MNIST dataset...")
+    dataloader, dataset = create_fashion_mnist_dataloader(batch_size=BATCH_SIZE, num_workers=2)
+    print(f"Dataset loaded successfully!")
+    print(f"Total images: {len(dataset)}")
+    print(f"Image size: {IMAGE_SIZE}x{IMAGE_SIZE}")
+    print(f"Classes: {len(FASHION_CLASSES)}")
+    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Batches per epoch: {len(dataloader)}")
+    print("\nShowing sample Fashion-MNIST images...")
+    show_fashion_samples(dataloader)
+    print("\nInitializing Fashion GAN...")
+    gan = FashionGAN(noise_dim=NOISE_DIM, img_size=IMAGE_SIZE, lr=LEARNING_RATE, beta1=BETA1)
+    print(f"Generator parameters: {sum(p.numel() for p in gan.generator.parameters()):,}")
+    print(f"Discriminator parameters: {sum(p.numel() for p in gan.discriminator.parameters()):,}")
+    print(f"\nStarting training for {NUM_EPOCHS} epochs...")
+    gan.train(dataloader, NUM_EPOCHS)
+    print("\nDisplaying training results...")
+    gan.plot_training_progress()
+
+ print("\nComparing real vs generated images...")
+    gan.compare_real_vs_fake(dataloader)
+    gan.save_models()
+    print("\n" + "=" * 40)
+    print("Fashion-MNIST GAN training completed!")
+  print("Check 'fashion_samples' folder for generated images during training.")
+    print("Models saved in 'fashion_gan_models' folder.")
+if __name__ == "__main__":
+    main()
