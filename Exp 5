@@ -1,0 +1,305 @@
+import os
+import math
+import time
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from datasets import load_dataset
+import sentencepiece as spm
+import numpy as np
+from pathlib import Path
+import sacrebleu
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED);
+if DEVICE.type == "cuda": torch.cuda.manual_seed_all(SEED)
+print("Device:", DEVICE)
+ 
+lang_pair = "en-fr"  
+src_lang, tgt_lang = lang_pair.split("-")
+ds = load_dataset("opus_books", lang_pair, split={"train":"train[:95%]", "validation":"train[95%:]"})
+print(ds)
+print("Samples:", len(ds["train"]), "/", len(ds["validation"]))
+ 
+for k in range(2):
+    ex = ds["train"][k]
+    print(f"\nSRC: {ex['translation'][src_lang]}\nTGT: {ex['translation'][tgt_lang]}")
+ 
+sp_dir = Path("spm")
+sp_dir.mkdir(exist_ok=True)
+src_corpus_file = sp_dir / f"train.{src_lang}.txt"
+tgt_corpus_file = sp_dir / f"train.{tgt_lang}.txt"
+with open(src_corpus_file, "w", encoding="utf-8") as fs, open(tgt_corpus_file, "w", encoding="utf-8") as ft:
+    for r in ds["train"]:
+        fs.write(r["translation"][src_lang].strip().replace("\n"," ") + "\n")
+        ft.write(r["translation"][tgt_lang].strip().replace("\n"," ") + "\n")
+PAD, BOS, EOS, UNK = "<pad>", "<s>", "</s>", "<unk>"
+def train_spm(input_path, model_prefix, vocab_size=8000):
+    spm.SentencePieceTrainer.Train(
+        input=str(input_path),
+        model_prefix=str(model_prefix),
+        vocab_size=vocab_size,
+        character_coverage=1.0,
+        model_type="bpe",
+        input_sentence_size=200000,
+        shuffle_input_sentence=True,
+        bos_id=1, eos_id=2, pad_id=0, unk_id=3,
+        bos_piece=BOS, eos_piece=EOS, pad_piece=PAD, unk_piece=UNK
+    )
+src_model_prefix = sp_dir / f"spm_{src_lang}"
+tgt_model_prefix = sp_dir / f"spm_{tgt_lang}"
+if not (sp_dir / f"spm_{src_lang}.model").exists():
+    train_spm(src_corpus_file, src_model_prefix, vocab_size=8000)
+if not (sp_dir / f"spm_{tgt_lang}.model").exists():
+    train_spm(tgt_corpus_file, tgt_model_prefix, vocab_size=8000)
+sp_src = spm.SentencePieceProcessor(model_file=str(sp_dir / f"spm_{src_lang}.model"))
+sp_tgt = spm.SentencePieceProcessor(model_file=str(sp_dir / f"spm_{tgt_lang}.model"))
+SRC_PAD_ID = sp_src.pad_id()
+SRC_BOS_ID = sp_src.bos_id()
+SRC_EOS_ID = sp_src.eos_id()
+TGT_PAD_ID = sp_tgt.pad_id()
+TGT_BOS_ID = sp_tgt.bos_id()
+TGT_EOS_ID = sp_tgt.eos_id()
+len_src_vocab = sp_src.vocab_size()
+len_tgt_vocab = sp_tgt.vocab_size()
+print("Vocab sizes:", len_src_vocab, len_tgt_vocab)
+ 
+MAX_LEN = 128  
+def encode_src(text):
+    ids = sp_src.encode(text, out_type=int, add_bos=True, add_eos=True)
+    return ids[:MAX_LEN]
+def encode_tgt(text):
+    ids = sp_tgt.encode(text, out_type=int, add_bos=True, add_eos=True)
+    return ids[:MAX_LEN]
+class MTDataset(Dataset):
+    def __init__(self, hf_split):
+        self.data = hf_split
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        pair = self.data[idx]["translation"]
+        src_ids = encode_src(pair[src_lang])
+       
+ tgt_ids = encode_tgt(pair[tgt_lang])
+        return torch.tensor(src_ids, dtype=torch.long), torch.tensor(tgt_ids, dtype=torch.long)
+def pad_batch(batch, pad_id_src=SRC_PAD_ID, pad_id_tgt=TGT_PAD_ID):
+    src_seqs, tgt_seqs = zip(*batch)
+    src_lens = [len(x) for x in src_seqs]
+    tgt_lens = [len(x) for x in tgt_seqs]
+    max_src = max(src_lens)
+    max_tgt = max(tgt_lens)
+    src_padded = torch.full((len(batch), max_src), pad_id_src, dtype=torch.long)
+    tgt_padded = torch.full((len(batch), max_tgt), pad_id_tgt, dtype=torch.long)
+    for i,(s,t) in enumerate(zip(src_seqs,tgt_seqs)):
+        src_padded[i,:len(s)] = s
+        tgt_padded[i,:len(t)] = t
+    return src_padded, tgt_padded
+train_data = MTDataset(ds["train"])
+val_data   = MTDataset(ds["validation"])
+BATCH_SIZE = 64
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_batch, drop_last=False)
+val_loader   = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False, collate_fn=pad_batch, drop_last=False)
+print("Train/Val sizes:", len(train_data), len(val_data))
+ 
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, emb_dim, hid_dim, num_layers=1, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=SRC_PAD_ID)
+        self.rnn = nn.GRU(emb_dim, hid_dim, num_layers=num_layers, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(hid_dim*2, hid_dim)  # project biGRU -> decoder hidden dim
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, src, src_mask=None):
+        emb = self.dropout(self.embedding(src))
+        outputs, hidden = self.rnn(emb)         
+        h_cat = torch.cat([hidden[-2], hidden[-1]], dim=1)  
+        h0 = torch.tanh(self.fc(h_cat)).unsqueeze(0)        
+        return outputs, h0
+class BahdanauAttention(nn.Module):
+    def __init__(self, enc_hid_dim, dec_hid_dim):
+        super().__init__()
+        
+        self.W1 = nn.Linear(enc_hid_dim*2, dec_hid_dim)
+        self.W2 = nn.Linear(dec_hid_dim, dec_hid_dim)
+        self.v  = nn.Linear(dec_hid_dim, 1, bias=False)
+    def forward(self, enc_outputs, dec_hidden, src_mask=None):
+        dec_hidden = dec_hidden.transpose(0,1)  
+       
+ scores = self.v(torch.tanh(self.W1(enc_outputs) + self.W2(dec_hidden))) 
+        scores = scores.squeeze(-1)  # (B,S)
+        if src_mask is not None:
+            scores = scores.masked_fill(~src_mask, -1e4)
+        attn = torch.softmax(scores, dim=-1)    # (B,S)
+        context = torch.bmm(attn.unsqueeze(1), enc_outputs).squeeze(1) 
+        return context, attn
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, emb_dim, enc_hid_dim, dec_hid_dim, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=TGT_PAD_ID)
+        self.attn = BahdanauAttention(enc_hid_dim, dec_hid_dim)
+        self.rnn = nn.GRU(emb_dim + enc_hid_dim*2, dec_hid_dim, batch_first=True)
+        self.fc_out = nn.Linear(dec_hid_dim + enc_hid_dim*2 + emb_dim, vocab_size)
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, input_tok, hidden, enc_outputs, src_mask=None):
+        emb = self.dropout(self.embedding(input_tok)).unsqueeze(1)  
+        context, attn = self.attn(enc_outputs, hidden, src_mask)   
+        rnn_input = torch.cat([emb, context.unsqueeze(1)], dim=-1)
+        output, hidden = self.rnn(rnn_input, hidden)                
+ logits = self.fc_out(torch.cat([output.squeeze(1), context, emb.squeeze(1)], dim=-1)) 
+        return logits, hidden, attn
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder, src_pad_id=SRC_PAD_ID, tgt_pad_id=TGT_PAD_ID):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_pad_id = src_pad_id
+        self.tgt_pad_id = tgt_pad_id
+    def make_src_mask(self, src):
+        return (src != self.src_pad_id)
+    def forward(self, src, tgt, teacher_forcing_ratio=0.5):
+        batch_size, tgt_len = tgt.size()
+        src_mask = self.make_src_mask(src)
+        enc_outputs, hidden = self.encoder(src, src_mask)
+        outputs = []
+        inp = tgt[:,0] 
+        for t in range(1, tgt_len):
+            logits, hidden, _ = self.decoder(inp, hidden, enc_outputs, src_mask)
+            outputs.append(logits.unsqueeze(1))  
+            teacher = (random.random() < teacher_forcing_ratio)
+       
+     next_tok = tgt[:,t] if teacher else torch.argmax(logits, dim=-1)
+            inp = next_tok
+        return torch.cat(outputs, dim=1)  
+EMB_DIM = 256
+HID_DIM = 512
+ENC_LAYERS = 1
+LR = 3e-4
+EPOCHS = 8
+CLIP = 1.0
+USE_AMP = True  
+encoder = Encoder(len_src_vocab, EMB_DIM, HID_DIM, num_layers=ENC_LAYERS, dropout=0.2)
+decoder = Decoder(len_tgt_vocab, EMB_DIM, HID_DIM, HID_DIM, dropout=0.2)
+model = Seq2Seq(encoder, decoder).to(DEVICE)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+criterion = nn.CrossEntropyLoss(ignore_index=TGT_PAD_ID)
+scaler = torch.cuda.amp.GradScaler(enabled=(USE_AMP and DEVICE.type=="cuda"))
+def train_epoch(model, loader):
+    model.train()
+    total_loss, total_tok = 0.0, 0
+    for src, tgt in loader:
+        src, tgt = src.to(DEVICE), tgt.to(DEVICE)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=(USE_AMP and DEVICE.type=="cuda")):
+            logits = model(src, tgt, teacher_forcing_ratio=0.5)  
+            gold = tgt[:,1:].contiguous()                     
+           
+        loss = criterion(logits.reshape(-1, logits.size(-1)), gold.reshape(-1))
+        scaler.scale(loss).backward()
+        if (USE_AMP and DEVICE.type=="cuda"):
+            scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+        ntokens = (gold != TGT_PAD_ID).sum().item()
+        total_loss += loss.item() * ntokens
+        total_tok += ntokens
+    return total_loss / max(1,total_tok)
+@torch.no_grad()
+def greedy_decode(model, src, max_len=100):
+    
+    src_mask = model.make_src_mask(src)
+    enc_outputs, hidden = model.encoder(src, src_mask)
+    B = src.size(0)
+    inp = torch.full((B,), TGT_BOS_ID, dtype=torch.long, device=src.device)
+    finished = torch.zeros(B, dtype=torch.bool, device=src.device)
+ 
+   outs = [[] for _ in range(B)]
+    for _ in range(max_len):
+        logits, hidden, _ = model.decoder(inp, hidden, enc_outputs, src_mask)
+        next_tok = torch.argmax(logits, dim=-1)
+        inp = next_tok
+        for i, tok in enumerate(next_tok.tolist()):
+            if not finished[i]:
+                if tok == TGT_EOS_ID:
+                    finished[i] = True
+                else:
+                    outs[i].append(tok)
+        if finished.all(): break
+    return outs
+@torch.no_grad()
+def evaluate_bleu(model, loader, max_len=100):
+    model.eval()
+    sys_outputs, refs = [], []
+    for src, tgt in loader:
+        src = src.to(DEVICE)
+        preds = greedy_decode(model, src, max_len=max_len)
+        for i in range(len(preds)):
+            hyp = sp_tgt.decode(preds[i])
+            tgt_i = tgt[i].tolist()
+            if TGT_BOS_ID in tgt_i:
+                tgt_i = tgt_i[1:]
+            if TGT_EOS_ID in tgt_i:
+                
+                eos_pos = tgt_i.index(TGT_EOS_ID)
+                tgt_i = tgt_i[:eos_pos]
+            ref = sp_tgt.decode(tgt_i)
+            sys_outputs.append(hyp)
+            refs.append(ref)
+    bleu = sacrebleu.corpus_bleu(sys_outputs, [refs]).score
+    return bleu
+ckpt_dir = Path("checkpoints"); ckpt_dir.mkdir(exist_ok=True)
+def load_checkpoint(path="checkpoints/best_seq2seq_attn.pt", model=model):
+    state = torch.load(path, map_location=DEVICE)
+    model.load_state_dict(state["model"])
+    model.to(DEVICE).eval()
+    print("Checkpoint loaded. Ready to translate.")
+    return model
+@torch.no_grad()
+def translate(sentences, max_len=80):
+    if isinstance(sentences, str):
+        sentences = [sentences]
+    src_batch = []
+    for s in sentences:
+        ids = encode_src(s)
+        src_batch.append(torch.tensor(ids, dtype=torch.long))
+    maxS = max(len(x) for x in src_batch)
+    pad_src = torch.full((len(src_batch), maxS), SRC_PAD_ID, dtype=torch.long)
+    for i, s in enumerate(src_batch):
+        pad_src[i,:len(s)] = s
+    pad_src = pad_src.to(DEVICE)
+    pred_ids = greedy_decode(model, pad_src, max_len=max_len)
+    return [sp_tgt.decode(p) for p in pred_ids]
+best_bleu = -1.0
+try:
+    for epoch in range(1, EPOCHS+1):
+        t0 = time.time()
+        train_loss = train_epoch(model, train_loader)
+        val_bleu = evaluate_bleu(model, val_loader, max_len=80)
+        dt = time.time() - t0
+        print(f"Epoch {epoch:02d} | train NLL/token: {train_loss:.6f} | val BLEU: {val_bleu:5.2f} | {dt:.1f}s")
+        if val_bleu > best_bleu:
+            best_bleu = val_bleu
+            torch.save({
+                "model": model.state_dict(),
+                "src_spm": str(sp_dir / f"spm_{src_lang}.model"),
+                "tgt_spm": str(sp_dir / f"spm_{tgt_lang}.model"),
+                "cfg": {
+                    "EMB_DIM": EMB_DIM, "HID_DIM": HID_DIM
+                }
+            }, ckpt_dir / "best_seq2seq_attn.pt")
+            print("  ✓ Saved new best checkpoint.")
+ 
+except RuntimeError as e:
+    print("RuntimeError during training:", e)
+    print("Possible OOM. Try reducing BATCH_SIZE or MAX_LEN, or set USE_AMP=False if on CPU.")
+except Exception as e:
+    print("Unexpected error:", e)
+samples = [
+    "I will meet you tomorrow at the library.",
+    "This book is very interesting and easy to read."
+]
+print("\nTranslations:")
+for s, t in zip(samples, translate(samples)):
+    print(f"{s}\n -> {t}\n")
+
