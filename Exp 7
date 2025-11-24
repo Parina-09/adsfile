@@ -1,0 +1,91 @@
+target_dir = '/usr/local/lib/python3.12/dist-packages/aif360/data/raw/adult'
+os.makedirs(target_dir, exist_ok=True)
+!wget -P {target_dir} https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data
+!wget -P {target_dir} https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.test
+!wget -P {target_dir} https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.names
+print(f"Downloaded files to {target_dir}")
+ 
+!ls {target_dir}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, confusion_matrix
+from aif360.datasets import AdultDataset
+from aif360.metrics import BinaryLabelDatasetMetric, ClassificationMetric
+from aif360.algorithms.preprocessing import Reweighing
+dataset = AdultDataset()  
+privileged_groups = [{'sex': 1}]     
+unprivileged_groups = [{'sex': 0}]   
+train, test = dataset.split([0.7], shuffle=True)
+X_train, y_train = train.features, train.labels.ravel()
+X_test, y_test = test.features, test.labels.ravel()
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+model = LogisticRegression(max_iter=1000)
+model.fit(X_train_scaled, y_train)
+y_pred = model.predict(X_test_scaled)
+acc = accuracy_score(y_test, y_pred)
+print(f"Baseline Accuracy: {acc:.2f}")
+ 
+test_pred = test.copy()
+test_pred.labels = y_pred.reshape(-1,1)
+metric = ClassificationMetric(
+    
+test, test_pred,
+    privileged_groups=privileged_groups,
+    unprivileged_groups=unprivileged_groups
+)
+print("\n--- Fairness Metrics (Before Mitigation) ---")
+print(f"Disparate Impact: {metric.disparate_impact():.3f}")
+print(f"Statistical Parity Difference: {metric.statistical_parity_difference():.3f}")
+print(f"Equal Opportunity Difference: {metric.equal_opportunity_difference():.3f}")
+print(f"Average Odds Difference: {metric.average_odds_difference():.3f}")
+ 
+RW = Reweighing(unprivileged_groups=unprivileged_groups, privileged_groups=privileged_groups)
+train_transf = RW.fit_transform(train)
+model_rw = LogisticRegression(max_iter=1000)
+model_rw.fit(X_train_scaled, y_train, sample_weight=train_transf.instance_weights)
+y_pred_rw = model_rw.predict(X_test_scaled)
+acc_rw = accuracy_score(y_test, y_pred_rw)
+print(f"\nAccuracy After Reweighing: {acc_rw:.2f}")
+ 
+test_pred_rw = test.copy()
+test_pred_rw.labels = y_pred_rw.reshape(-1,1)
+metric_rw = ClassificationMetric(
+    test, test_pred_rw,
+    privileged_groups=privileged_groups,
+    unprivileged_groups=unprivileged_groups
+)
+print("\n--- Fairness Metrics (After Reweighing) ---")
+print(f"Disparate Impact: {metric_rw.disparate_impact():.3f}")
+print(f"Statistical Parity Difference: {metric_rw.statistical_parity_difference():.3f}")
+print(f"Equal Opportunity Difference: {metric_rw.equal_opportunity_difference():.3f}")
+print(f"Average Odds Difference: {metric_rw.average_odds_difference():.3f}")
+ 
+metrics_before = [
+    metric.disparate_impact(),
+    metric.statistical_parity_difference(),
+    metric.equal_opportunity_difference(),
+    metric.average_odds_difference()
+]
+metrics_after = [
+    metric_rw.disparate_impact(),
+    metric_rw.statistical_parity_difference(),
+    metric_rw.equal_opportunity_difference(),
+    metric_rw.average_odds_difference()
+]
+labels = ['Disparate Impact', 'Statistical Parity', 'Equal Opportunity', 'Average Odds']
+x = np.arange(len(labels))
+width = 0.35
+plt.figure(figsize=(10,5))
+plt.bar(x - width/2, metrics_before, width, label='Before Mitigation')
+plt.bar(x + width/2, metrics_after, width, label='After Mitigation')
+plt.xticks(x, labels, rotation=15)
+plt.title('Fairness Metric Comparison')
+plt.legend()
+plt.show()
+
