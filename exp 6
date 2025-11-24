@@ -1,0 +1,52 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import precision_score, recall_score, f1_score
+np.random.seed(42)
+time = np.arange(0, 200, 0.5)
+signal = np.sin(time) + np.random.normal(0, 0.1, len(time))
+signal[50] += 3
+signal[150] -= 3
+signal[250] += 4
+data = pd.DataFrame({"time": time, "value": signal})
+plt.figure(figsize=(10,4))
+plt.plot(data["time"], data["value"], label="Time Series")
+plt.title("Synthetic Time Series Data with Anomalies")
+plt.xlabel("Time")
+plt.ylabel("Value")
+plt.legend()
+plt.show()
+ 
+true_anomalies = np.zeros(len(signal))
+true_anomalies[[50,150,250]] = 1
+z_scores = np.abs((signal - np.mean(signal)) / np.std(signal))
+threshold = 3
+z_pred = (z_scores > threshold).astype(int)
+scaler = StandardScaler()
+scaled_signal = scaler.fit_transform(signal.reshape(-1,1))
+iso_forest = IsolationForest(contamination=0.02, random_state=42)
+iso_pred = (iso_forest.fit_predict(scaled_signal) == -1).astype(int)
+ocsvm = OneClassSVM(kernel='rbf', nu=0.02, gamma=0.1)
+svm_pred = (ocsvm.fit_predict(scaled_signal) == -1).astype(int)
+plt.figure(figsize=(12,6))
+plt.plot(time, signal, label="Signal")
+plt.scatter(time[z_pred==1], signal[z_pred==1], color='red', label='Z-Score Anomaly')
+plt.scatter(time[iso_pred==1], signal[iso_pred==1], color='orange', label='Isolation Forest Anomaly')
+plt.scatter(time[svm_pred==1], signal[svm_pred==1], color='purple', label='One-Class SVM Anomaly')
+plt.legend()
+plt.title("Anomaly Detection Results (Multiple Methods)")
+plt.show()
+ 
+def evaluate(y_true, y_pred, name):
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    print(f"{name} -> Precision: {precision:.2f}, Recall: {recall:.2f}, F1-Score: {f1:.2f}")
+print("\n--- Evaluation Metrics ---")
+evaluate(true_anomalies, z_pred, "Z-Score")
+evaluate(true_anomalies, iso_pred, "Isolation Forest")
+evaluate(true_anomalies, svm_pred, "One-Class SVM")
+
