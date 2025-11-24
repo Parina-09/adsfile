@@ -1,0 +1,128 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.image as mpimg
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPool2D, Dense, Flatten, Dropout
+train = pd.read_csv("train.csv")
+test = pd.read_csv("test.csv")
+train.head()
+test.head()
+print(train.isna().sum().sum())
+print(test.isna().sum().sum())
+train['label'].value_counts().sort_index()
+fig, ax = plt.subplots(figsize=(18, 8))
+for ind, row in train.iloc[:8, :].iterrows():
+    plt.subplot(2, 4, ind+1)
+    plt.title(row[0])
+    img = row.to_numpy()[1:].reshape(28, 28)
+    fig.suptitle('Train images', fontsize=24)
+    plt.axis('off')
+    plt.imshow(img, cmap='magma')
+fig, ax = plt.subplots(figsize=(18, 8))
+for ind, row in test.iloc[:8, :].iterrows():
+    plt.subplot(2, 4, ind+1)
+    img = row.to_numpy()[:].reshape(28, 28)
+    fig.suptitle('Test images', fontsize=24)
+    plt.axis('off')
+    plt.imshow(img, cmap='magma')
+X = train.iloc[:, 1:].to_numpy()
+y = train['label'].to_numpy()
+test = test.loc[:, :].to_numpy()
+for i in [X, y, test]:
+    print(i.shape)
+X = X / 255.0
+test = test / 255.0
+print(X.shape)
+print(test.shape)
+X = X.reshape(-1,28,28,1)
+test = test.reshape(-1,28,28,1)
+print(X.shape)
+print(test.shape)
+print(y.shape)
+print(y[0])
+y_enc = to_categorical(y, num_classes = 10)
+print(y_enc.shape)
+print(y_enc[0])
+random_seed = 2
+X_train, X_val, y_train_enc, y_val_enc = train_test_split(X, y_enc, test_size=0.3)
+for i in [X_train, y_train_enc, X_val, y_val_enc]:
+    print(i.shape)
+g = plt.imshow(X_train[0][:,:,0])
+print(y_train_enc[0])
+g = plt.imshow(X_train[9][:,:,0])
+print(y_train_enc[9])
+INPUT_SHAPE = (28,28,1)
+OUTPUT_SHAPE = 10
+BATCH_SIZE = 128
+EPOCHS = 10
+VERBOSE = 2
+model = Sequential()
+model.add(Conv2D(32, kernel_size=(3,3), activation='relu', input_shape=INPUT_SHAPE))
+model.add(MaxPool2D((2,2)))
+model.add(Conv2D(64, kernel_size=(3,3), activation='relu'))
+model.add(MaxPool2D((2,2)))
+model.add(Conv2D(128, kernel_size=(3,3), activation='relu'))
+model.add(MaxPool2D((2,2)))
+model.add(Flatten())
+model.add(Dense(256, activation='relu'))
+model.add(Dropout(0.2))
+model.add(Dense(128, activation='relu'))
+model.add(Dropout(0.2))
+model.add(Dense(64, activation='relu'))
+model.add(Dropout(0.2))
+model.add(Dense(10, activation='softmax'))
+model.compile(optimizer='adam',
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+model.summary()
+history = model.fit(X_train, y_train_enc,
+                    epochs=EPOCHS,
+                    batch_size=BATCH_SIZE,
+                    verbose=VERBOSE,
+                    validation_split=0.3)
+plt.figure(figsize=(14, 5))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.legend(loc='lower right')
+plt.title('Training and Validation Accuracy')
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.legend(loc='upper right')
+plt.title('Training and Validation Loss')
+plt.savefig('./foo.png')
+plt.show()
+model.evaluate(X_val, y_val_enc, verbose=False)
+y_pred_enc = model.predict(X_val)
+y_act = [np.argmax(i) for i in y_val_enc]
+y_pred = [np.argmax(i) for i in y_pred_enc]
+print(y_pred_enc[0])
+print(y_pred[0])
+print(classification_report(y_act, y_pred))
+fig, ax = plt.subplots(figsize=(7, 7))
+sns.heatmap(confusion_matrix(y_act, y_pred), annot=True,
+            cbar=False, fmt='1d', cmap='Blues', ax=ax)
+ax.set_title('Confusion Matrix', loc='left', fontsize=16)
+ax.set_xlabel('Predicted')
+ax.set_ylabel('Actual')
+plt.show()
+y_pred_enc = model.predict(test)
+y_pred = [np.argmax(i) for i in y_pred_enc]
+print(y_pred_enc[0])
+print(y_pred[0])
+fig, ax = plt.subplots(figsize=(18, 12))
+for ind, row in enumerate(test[:15]):
+    plt.subplot(3, 5, ind+1)
+    plt.title(y_pred[ind])
+    img = row.reshape(28, 28)
+    fig.suptitle('Predicted values', fontsize=24)
+    plt.axis('off')
+    plt.imshow(img, cmap='cividis')
+ 
+
